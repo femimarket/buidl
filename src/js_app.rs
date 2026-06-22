@@ -5,12 +5,11 @@ use std::process::Command;
 pub fn run() -> Result<()> {
     let repo = git2::Repository::open(".").context("opening git repo")?;
 
-    // Stage everything (additions, modifications, deletions), but skip
-    // IGNOREFILES patterns at the staging step so build output, Xcode user
-    // state, and lockfiles never enter the index. Without this, they'd show
-    // up in the diff (forcing spurious `chore: update` commits) AND get
-    // bundled into the commit body.
     let mut index = repo.index().context("getting index")?;
+    // Skip IGNOREFILES patterns at the staging step (rather than filtering
+    // post-diff) so build output, Xcode user state, and lockfiles never enter
+    // the index — otherwise they'd both show up in the diff (forcing spurious
+    // `chore: update` commits) AND get bundled into the commit body.
     index.add_all(
         ["*"],
         git2::IndexAddOption::DEFAULT,
@@ -20,10 +19,7 @@ pub fn run() -> Result<()> {
     ).context("staging all")?;
     index.write().context("writing index")?;
 
-    // Compare the index tree to HEAD's tree. Bail BEFORE bumping/publishing/
-    // tagging if there's nothing to commit — otherwise we accumulate phantom
-    // tags on the same commit (the v1.0.2 collision we hit earlier).
-    // Unborn branch (initial commit run) → no HEAD ref; diff against empty tree.
+    // Unborn branch → diff against empty tree so initial commits still work.
     let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
     let diff = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), None)
         .context("diffing HEAD to index")?;
@@ -32,7 +28,6 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Per-file: path + binary flag, pulled straight from the diff deltas.
     let files: Vec<(String, bool)> = diff.deltas().filter_map(|d| {
         let path = d.new_file().path().or_else(|| d.old_file().path())?
             .to_string_lossy().into_owned();
@@ -45,19 +40,10 @@ pub fn run() -> Result<()> {
     let has_md = files.iter().any(|(p, _)| is_md(p));
     let has_real = files.iter().any(|(p, b)| !is_md(p) && !buidl::is_ignored(p) && !b);
 
-    eprintln!("[buidl] {} staged file(s):", files.len());
-    for (p, b) in &files {
-        let cat = if *b { "binary" }
-            else if is_md(p) { "md" }
-            else { "REAL" };
-        eprintln!("[buidl]   {cat:>7}  {p}");
-    }
-
     let commit_msg = if !has_real {
         if has_md { "docs: update documentation".to_string() }
         else { "chore: update".to_string() }
     } else {
-        // Build a filtered diff via pathspecs (include only real-code files).
         let mut opts = git2::DiffOptions::new();
         for (path, bin) in &files {
             if !is_md(path) && !buidl::is_ignored(path) && !bin {
@@ -66,7 +52,6 @@ pub fn run() -> Result<()> {
         }
         let filtered = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), Some(&mut opts))
             .context("computing filtered diff")?;
-        // Render as a unified-patch string for the LLM.
         let mut diff_text = String::new();
         filtered.print(git2::DiffFormat::Patch, |_d, _h, line| {
             let content = std::str::from_utf8(line.content()).unwrap_or("");
@@ -100,10 +85,6 @@ pub fn run() -> Result<()> {
         message
     };
 
-    // Conventional Commits → semver:
-    //   - `!` before `:` OR "BREAKING CHANGE" in body → major
-    //   - `feat`                                      → minor
-    //   - anything else                               → patch
     let first_line = commit_msg.lines().next().unwrap_or("");
     let head = first_line.split(':').next().unwrap_or("");
     let bump_kind: &str = if head.ends_with('!') || commit_msg.contains("BREAKING CHANGE") {
@@ -113,8 +94,6 @@ pub fn run() -> Result<()> {
         if type_part == "feat" { "minor" } else { "patch" }
     };
 
-    // Highest existing tag by semver tuple — deterministic even when multiple
-    // tags point at the same commit (which is what broke `git describe`).
     let last = repo.tag_names(None).context("listing tags")?
         .iter().flatten().flatten()
         .filter_map(|t| {
@@ -132,15 +111,19 @@ pub fn run() -> Result<()> {
         (Some((major, minor, patch)), _) => format!("v{major}.{minor}.{}", patch + 1),
     };
 
-    // Openapi-generated kotlin libraries bake the version into build.gradle.kts
-    // (`version = "X.Y.Z"`). Sync it to the new tag here so the commit that
-    // gets tagged reflects the published version — otherwise the next regen
-    // sees a stale version line and triggers a spurious commit.
+    // Openapi-generated typescript-fetch projects always emit a
+    // `.openapi-generator/` dir and a `.openapi-generator-ignore` file. If
+    // either exists we additionally sync the version baked into package.json
+    // (root `"version"`) and README.md (`# <name>@<ver>` + `- Package version:
+    // \`<ver>\``) — otherwise the generator's defaults (1.0.0) would lag
+    // behind the git tag forever and trigger spurious commits next run.
     let is_openapi = Path::new(".openapi-generator").is_dir()
         || Path::new(".openapi-generator-ignore").is_file();
     if is_openapi {
         let version = new_tag.strip_prefix('v').unwrap_or(&new_tag);
-        sync_kotlin_versions(version).context("syncing kotlin version markers")?;
+        sync_openapi_versions(version).context("syncing openapi version markers")?;
+        // The sed-equivalent touched files that were already staged — re-stage
+        // so the commit captures the synced versions.
         index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)
             .context("re-staging after version sync")?;
         index.write().context("writing index after version sync")?;
@@ -149,12 +132,9 @@ pub fn run() -> Result<()> {
     println!("🚀 Publishing {new_tag} to GitHub...");
     println!("{commit_msg}");
 
-    // Commit: write the index as a tree, then create a commit on HEAD pointing
-    // at it. Author/committer from git config; no hooks, no GPG signing.
     let tree_oid = index.write_tree().context("writing tree from index")?;
     let tree = repo.find_tree(tree_oid).context("finding tree")?;
     let sig = repo.signature().context("getting signature from git config")?;
-    // Initial commit on an unborn branch has no parent.
     let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
     let parents: Vec<&git2::Commit> = parent.iter().collect();
     repo.commit(Some("HEAD"), &sig, &sig, &commit_msg, &tree, &parents)
@@ -163,19 +143,6 @@ pub fn run() -> Result<()> {
     println!("⏳ Pushing code...");
     if !Command::new("git").args(["push", "origin", "main"]).status().context("git push")?.success() {
         return Err(anyhow!("git push failed"));
-    }
-
-    let maven_version = new_tag.strip_prefix('v').unwrap_or(&new_tag);
-    println!("📦 Building and publishing v{maven_version} to GitHub Packages...");
-    if !Command::new("./gradlew")
-        .args([
-            "publishAllPublicationsToGitHubPackagesRepository",
-            &format!("-PlibraryVersion={maven_version}"),
-        ])
-        .status().context("./gradlew publishAllPublicationsToGitHubPackagesRepository")?
-        .success()
-    {
-        return Err(anyhow!("./gradlew publishAllPublicationsToGitHubPackagesRepository failed"));
     }
 
     println!("🏷️ Creating tag {new_tag}...");
@@ -189,27 +156,52 @@ pub fn run() -> Result<()> {
         return Err(anyhow!("git push tag failed"));
     }
 
-    println!("✅ Successfully published v{maven_version} to GitHub Packages and pushed {new_tag} to GitHub!");
+    println!("✅ Successfully pushed {new_tag} to GitHub!");
     Ok(())
 }
 
-/// Update the top-level `version = "X.Y.Z"` line in build.gradle.kts to the
-/// released semver. Mirrors the bash sed `/^version = / s/"[^"]*"/"$NEW"/`.
-fn sync_kotlin_versions(version: &str) -> Result<()> {
-    let path = Path::new("build.gradle.kts");
-    if !path.is_file() { return Ok(()); }
-
-    let content = std::fs::read_to_string(path).context("reading build.gradle.kts")?;
-    let mut out_lines: Vec<String> = Vec::with_capacity(content.lines().count() + 1);
-    for line in content.lines() {
-        if line.starts_with("version = ") {
-            out_lines.push(format!("version = \"{version}\""));
-            continue;
+/// Update `package.json`'s `version` field and the two version markers in
+/// `README.md` (`# <name>@<ver>` heading + `- Package version: \`<ver>\`` line)
+/// to the released semver. Mirrors the bash sed block from build.sh's JS loop.
+fn sync_openapi_versions(version: &str) -> Result<()> {
+    let pkg_path = Path::new("package.json");
+    if pkg_path.is_file() {
+        let content = std::fs::read_to_string(pkg_path).context("reading package.json")?;
+        let mut json: serde_json::Value = serde_json::from_str(&content)
+            .context("parsing package.json")?;
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("version".to_string(), serde_json::Value::String(version.to_string()));
         }
-        out_lines.push(line.to_string());
+        let pretty = serde_json::to_string_pretty(&json).context("serializing package.json")?;
+        std::fs::write(pkg_path, format!("{pretty}\n")).context("writing package.json")?;
     }
-    let mut new_content = out_lines.join("\n");
-    if content.ends_with('\n') { new_content.push('\n'); }
-    std::fs::write(path, new_content).context("writing build.gradle.kts")?;
+
+    let readme_path = Path::new("README.md");
+    if readme_path.is_file() {
+        let content = std::fs::read_to_string(readme_path).context("reading README.md")?;
+        let mut out_lines: Vec<String> = Vec::with_capacity(content.lines().count() + 1);
+        for line in content.lines() {
+            // `# <name>@<old-ver>` → `# <name>@<new-ver>`. Matches whatever
+            // npmName the generator used, doesn't care about the project name.
+            if let Some(rest) = line.strip_prefix("# ") {
+                if let Some((name, _old)) = rest.split_once('@') {
+                    out_lines.push(format!("# {name}@{version}"));
+                    continue;
+                }
+            }
+            // `- Package version: \`<old-ver>\`` → `\`<new-ver>\``. Note: does
+            // NOT touch `- API version: \`...\`` — that's the spec version,
+            // independent of the package release.
+            if line.starts_with("- Package version: ") {
+                out_lines.push(format!("- Package version: `{version}`"));
+                continue;
+            }
+            out_lines.push(line.to_string());
+        }
+        let mut new_content = out_lines.join("\n");
+        if content.ends_with('\n') { new_content.push('\n'); }
+        std::fs::write(readme_path, new_content).context("writing README.md")?;
+    }
+
     Ok(())
 }

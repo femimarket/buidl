@@ -5,11 +5,11 @@ use std::process::Command;
 pub fn run() -> Result<()> {
     let repo = git2::Repository::open(".").context("opening git repo")?;
 
-    // Stage everything (additions, modifications, deletions), but skip
-    // IGNOREFILES patterns at the staging step so build output, Xcode user
-    // state, and lockfiles never enter the index. Without this, they'd show
-    // up in the diff (forcing spurious `chore: update` commits) AND get
-    // bundled into the commit body.
+    // Stage everything but skip IGNOREFILES patterns at the staging step so
+    // build output (`.build/`, `DerivedData/`), Xcode user state
+    // (`xcuserdata/`, `.xcuserstate`), and lockfiles never enter the index —
+    // otherwise they'd both show up in the diff (forcing spurious `chore:
+    // update` commits) AND get bundled into the commit body.
     let mut index = repo.index().context("getting index")?;
     index.add_all(
         ["*"],
@@ -20,9 +20,6 @@ pub fn run() -> Result<()> {
     ).context("staging all")?;
     index.write().context("writing index")?;
 
-    // Compare the index tree to HEAD's tree. Bail BEFORE bumping/publishing/
-    // tagging if there's nothing to commit — otherwise we accumulate phantom
-    // tags on the same commit (the v1.0.2 collision we hit earlier).
     // Unborn branch (initial commit run) → no HEAD ref; diff against empty tree.
     let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
     let diff = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), None)
@@ -32,7 +29,6 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Per-file: path + binary flag, pulled straight from the diff deltas.
     let files: Vec<(String, bool)> = diff.deltas().filter_map(|d| {
         let path = d.new_file().path().or_else(|| d.old_file().path())?
             .to_string_lossy().into_owned();
@@ -57,7 +53,6 @@ pub fn run() -> Result<()> {
         if has_md { "docs: update documentation".to_string() }
         else { "chore: update".to_string() }
     } else {
-        // Build a filtered diff via pathspecs (include only real-code files).
         let mut opts = git2::DiffOptions::new();
         for (path, bin) in &files {
             if !is_md(path) && !buidl::is_ignored(path) && !bin {
@@ -66,7 +61,6 @@ pub fn run() -> Result<()> {
         }
         let filtered = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), Some(&mut opts))
             .context("computing filtered diff")?;
-        // Render as a unified-patch string for the LLM.
         let mut diff_text = String::new();
         filtered.print(git2::DiffFormat::Patch, |_d, _h, line| {
             let content = std::str::from_utf8(line.content()).unwrap_or("");
@@ -100,10 +94,6 @@ pub fn run() -> Result<()> {
         message
     };
 
-    // Conventional Commits → semver:
-    //   - `!` before `:` OR "BREAKING CHANGE" in body → major
-    //   - `feat`                                      → minor
-    //   - anything else                               → patch
     let first_line = commit_msg.lines().next().unwrap_or("");
     let head = first_line.split(':').next().unwrap_or("");
     let bump_kind: &str = if head.ends_with('!') || commit_msg.contains("BREAKING CHANGE") {
@@ -113,8 +103,6 @@ pub fn run() -> Result<()> {
         if type_part == "feat" { "minor" } else { "patch" }
     };
 
-    // Highest existing tag by semver tuple — deterministic even when multiple
-    // tags point at the same commit (which is what broke `git describe`).
     let last = repo.tag_names(None).context("listing tags")?
         .iter().flatten().flatten()
         .filter_map(|t| {
@@ -132,25 +120,9 @@ pub fn run() -> Result<()> {
         (Some((major, minor, patch)), _) => format!("v{major}.{minor}.{}", patch + 1),
     };
 
-    // Openapi-generated kotlin libraries bake the version into build.gradle.kts
-    // (`version = "X.Y.Z"`). Sync it to the new tag here so the commit that
-    // gets tagged reflects the published version — otherwise the next regen
-    // sees a stale version line and triggers a spurious commit.
-    let is_openapi = Path::new(".openapi-generator").is_dir()
-        || Path::new(".openapi-generator-ignore").is_file();
-    if is_openapi {
-        let version = new_tag.strip_prefix('v').unwrap_or(&new_tag);
-        sync_kotlin_versions(version).context("syncing kotlin version markers")?;
-        index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)
-            .context("re-staging after version sync")?;
-        index.write().context("writing index after version sync")?;
-    }
-
     println!("🚀 Publishing {new_tag} to GitHub...");
     println!("{commit_msg}");
 
-    // Commit: write the index as a tree, then create a commit on HEAD pointing
-    // at it. Author/committer from git config; no hooks, no GPG signing.
     let tree_oid = index.write_tree().context("writing tree from index")?;
     let tree = repo.find_tree(tree_oid).context("finding tree")?;
     let sig = repo.signature().context("getting signature from git config")?;
@@ -165,19 +137,6 @@ pub fn run() -> Result<()> {
         return Err(anyhow!("git push failed"));
     }
 
-    let maven_version = new_tag.strip_prefix('v').unwrap_or(&new_tag);
-    println!("📦 Building and publishing v{maven_version} to GitHub Packages...");
-    if !Command::new("./gradlew")
-        .args([
-            "publishAllPublicationsToGitHubPackagesRepository",
-            &format!("-PlibraryVersion={maven_version}"),
-        ])
-        .status().context("./gradlew publishAllPublicationsToGitHubPackagesRepository")?
-        .success()
-    {
-        return Err(anyhow!("./gradlew publishAllPublicationsToGitHubPackagesRepository failed"));
-    }
-
     println!("🏷️ Creating tag {new_tag}...");
     let head_commit = repo.head().context("getting HEAD")?
         .peel_to_commit().context("peeling HEAD to commit")?;
@@ -189,27 +148,6 @@ pub fn run() -> Result<()> {
         return Err(anyhow!("git push tag failed"));
     }
 
-    println!("✅ Successfully published v{maven_version} to GitHub Packages and pushed {new_tag} to GitHub!");
-    Ok(())
-}
-
-/// Update the top-level `version = "X.Y.Z"` line in build.gradle.kts to the
-/// released semver. Mirrors the bash sed `/^version = / s/"[^"]*"/"$NEW"/`.
-fn sync_kotlin_versions(version: &str) -> Result<()> {
-    let path = Path::new("build.gradle.kts");
-    if !path.is_file() { return Ok(()); }
-
-    let content = std::fs::read_to_string(path).context("reading build.gradle.kts")?;
-    let mut out_lines: Vec<String> = Vec::with_capacity(content.lines().count() + 1);
-    for line in content.lines() {
-        if line.starts_with("version = ") {
-            out_lines.push(format!("version = \"{version}\""));
-            continue;
-        }
-        out_lines.push(line.to_string());
-    }
-    let mut new_content = out_lines.join("\n");
-    if content.ends_with('\n') { new_content.push('\n'); }
-    std::fs::write(path, new_content).context("writing build.gradle.kts")?;
+    println!("✅ Successfully pushed {new_tag} to GitHub!");
     Ok(())
 }
