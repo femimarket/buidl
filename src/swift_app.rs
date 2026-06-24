@@ -120,6 +120,13 @@ pub fn run() -> Result<()> {
         (Some((major, minor, patch)), _) => format!("v{major}.{minor}.{}", patch + 1),
     };
 
+    // Regenerate README.md from the full codebase so docs stay in sync with
+    // code. Gated on `has_real` so a README-only or chore-only commit doesn't
+    // trigger another regen → another commit → infinite loop.
+    if has_real {
+        buidl::regenerate_readme(&mut index).context("regenerating README.md")?;
+    }
+
     println!("🚀 Publishing {new_tag} to GitHub...");
     println!("{commit_msg}");
 

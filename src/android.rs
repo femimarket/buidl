@@ -141,9 +141,21 @@ pub fn run() -> Result<()> {
     if is_openapi {
         let version = new_tag.strip_prefix('v').unwrap_or(&new_tag);
         sync_kotlin_versions(version).context("syncing kotlin version markers")?;
-        index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)
-            .context("re-staging after version sync")?;
+        index.add_all(
+            ["*"],
+            git2::IndexAddOption::DEFAULT,
+            Some(&mut |p: &Path, _spec: &[u8]| -> i32 {
+                if buidl::is_ignored(&p.to_string_lossy()) { 1 } else { 0 }
+            }),
+        ).context("re-staging after version sync")?;
         index.write().context("writing index after version sync")?;
+    }
+
+    // Regenerate README.md from the full codebase so docs stay in sync with
+    // code. Gated on `has_real` so a README-only or chore-only commit doesn't
+    // trigger another regen → another commit → infinite loop.
+    if has_real {
+        buidl::regenerate_readme(&mut index).context("regenerating README.md")?;
     }
 
     println!("🚀 Publishing {new_tag} to GitHub...");

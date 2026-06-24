@@ -124,9 +124,22 @@ pub fn run() -> Result<()> {
         sync_openapi_versions(version).context("syncing openapi version markers")?;
         // The sed-equivalent touched files that were already staged — re-stage
         // so the commit captures the synced versions.
-        index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)
-            .context("re-staging after version sync")?;
+        index.add_all(
+            ["*"],
+            git2::IndexAddOption::DEFAULT,
+            Some(&mut |p: &Path, _spec: &[u8]| -> i32 {
+                if buidl::is_ignored(&p.to_string_lossy()) { 1 } else { 0 }
+            }),
+        ).context("re-staging after version sync")?;
         index.write().context("writing index after version sync")?;
+    }
+
+    // Regenerate README.md from the full codebase so docs stay in sync with
+    // code. Gated on `has_real` so a README-only or chore-only commit doesn't
+    // trigger another regen → another commit → infinite loop. The new README
+    // joins this same commit via `index.add_path` inside regenerate_readme.
+    if has_real {
+        buidl::regenerate_readme(&mut index).context("regenerating README.md")?;
     }
 
     println!("🚀 Publishing {new_tag} to GitHub...");
