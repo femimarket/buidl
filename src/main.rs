@@ -1,13 +1,9 @@
-// JSON-driven build orchestrator. Reads a build.json describing repos to
-// release (currently only `swiftapps[]`), and runs the canonical commit →
-// README regen → push → tag flow per entry. `kind: "openapi"` entries also
-// pre-wipe the output dir and spawn openapi-generator before the commit pass.
-//
-// Per-language modules (swift_app.rs / android.rs / js_app.rs / commit.rs)
-// are kept on disk as reference but no longer wired into the build — the
-// canonical flow lives here, using helpers from lib.rs.
+// JSON-driven build orchestrator. build.json is a flat list of entries; the
+// language of each entry is auto-detected from files on disk. The only
+// optional `kind` is `"openapi"`, which triggers a pre-wipe + openapi-generator
+// pass before the canonical commit/README/push/tag flow.
 
-use buidl::{BuildConfig, SPEC};
+use buidl::{BuildConfig, RepoKind};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 
@@ -26,41 +22,36 @@ fn main() {
     let cfg: BuildConfig = serde_json::from_str(&raw)
         .unwrap_or_else(|e| panic!("parsing {}: {e}", cli.config.display()));
 
-    for entry in &cfg.swiftapps {
+    for entry in &cfg {
         let path = Path::new(&entry.path);
         println!("\n==> {}", entry.path);
 
-        // `kind: "openapi"` → wipe (if requested) + spawn openapi-generator
-        // before the commit pass so leftover files from a prior spec don't
-        // survive and the regen output matches the live spec.
+        // `kind: "openapi"` → seed generator with last tag, wipe (if
+        // requested), then spawn openapi-generator before the commit pass.
         if entry.kind.as_deref() == Some("openapi") {
             let data = entry.data.as_ref()
                 .unwrap_or_else(|| panic!("openapi entry {} missing `data`", entry.path));
             let templates = data.templates.as_deref()
                 .unwrap_or_else(|| panic!("openapi entry {} missing `data.templates`", entry.path));
 
+            // Read the last tag BEFORE wipe (wipe keeps .git/, so tags
+            // survive, but it's clearer to grab it first).
+            let pre_repo = git2::Repository::open(path)
+                .unwrap_or_else(|e| panic!("opening repo at {} (to read last tag): {e}", path.display()));
+            let last_tag_raw = buidl::last_tag(&pre_repo);
+
             if data.delete_all_except_git {
                 buidl::wipe_except_git(path);
             }
-
-            // Hardcoded swift6 properties — same as the old build.sh swift
-            // loop. Lives here, not in lib.rs, because each language flavor
-            // has its own flag set. Move to build.json `data.*` once a
-            // second flavor lands.
-            buidl::run_openapi_generator(&[
-                "-g", "swift6",
-                "-i", SPEC,
-                "-o", &entry.path,
-                "-t", templates,
-                "--additional-properties", "projectName=Api,responseAs=AsyncAwait",
-            ]);
+            buidl::run_openapi_generator_for_templates(&entry.path, templates, &last_tag_raw);
         }
 
+        // Auto-detect language from files. Drives the publish step below.
+        let kind = buidl::detect_kind(path);
+        println!("[buidl] detected kind: {kind:?}");
+
         // Canonical "stage → diff → commit-msg → bump → README → commit →
-        // push → tag" sequence. Identical for every swift entry regardless of
-        // kind. Skips cleanly when nothing changed OR when the only changes
-        // were ignored/binary churn (pushing a "chore: update" tag for that
-        // case was always wrong).
+        // push → tag" sequence. Identical for every kind.
         let repo = git2::Repository::open(path)
             .unwrap_or_else(|e| panic!("opening git repo at {}: {e}", path.display()));
 
@@ -71,16 +62,28 @@ fn main() {
             continue;
         }
 
-        buidl::print_staged(&files);
-        let commit_msg = buidl::commit_msg_for_diff(&repo, &index, head_tree.as_ref(), &files);
+        // Commit message uses the full staged diff minus anything matching
+        // `commitIgnore.glob` (typically lockfiles or generated noise that
+        // bloat the prompt without informing the message). `print_staged`
+        // labels each file with whether it reaches the LLM, so the log
+        // reflects the actual filtered set, not just the raw inventory.
+        let ignore_globs: Option<&[String]> =
+            entry.commit_ignore.as_ref().map(|c| c.glob.as_slice());
+        buidl::print_staged(&files, ignore_globs);
+        let commit_msg = buidl::commit_msg_for_diff(
+            &repo, &index, head_tree.as_ref(), &files, ignore_globs,
+        );
 
-        let kind = buidl::bump_kind(&commit_msg);
-        let new_tag = buidl::compute_new_tag(&repo, kind);
+        let bump = buidl::bump_kind(&commit_msg);
+        let new_tag = buidl::compute_new_tag(&repo, bump);
 
-        // README regen reads the whole repo, rewrites README.md, re-stages
-        // it into the same index. Joined with this same commit by
-        // `commit_with_msg` below.
-        buidl::regenerate_readme(&mut index);
+        // README regen is opt-in via the `readme` field. Absent → skip
+        // entirely. Present → regen using only files whose path matches one
+        // of `readme.glob`. The new README joins this same commit via
+        // `index.add_path` inside `regenerate_readme`.
+        if let Some(readme_cfg) = &entry.readme {
+            buidl::regenerate_readme(&repo, &mut index, &readme_cfg.glob);
+        }
 
         println!("🚀 Publishing {new_tag} to GitHub...");
         println!("{commit_msg}");
@@ -91,6 +94,18 @@ fn main() {
         buidl::git_push_main(path);
         println!("🏷️ Creating tag {new_tag} and pushing...");
         buidl::tag_and_push(&repo, &new_tag, path);
+
+        // Per-kind extra publish step. Swift, Rust, Js, Generic are done —
+        // git tag IS the artifact. Android and Kotlin libraries get an
+        // additional gradle publish to GitHub Packages.
+        match kind {
+            RepoKind::Android | RepoKind::Kotlin => {
+                buidl::gradle_publish_github_packages(path, &new_tag);
+            }
+            RepoKind::Swift | RepoKind::Rust | RepoKind::Js | RepoKind::Generic => {
+                // Nothing to do — tag IS the artifact.
+            }
+        }
 
         println!("✅ Successfully pushed {new_tag} to GitHub!");
     }
