@@ -10,8 +10,8 @@ use std::path::Path;
 use tempfile::TempDir;
 
 use buidl::{
-    BuildConfig, DEFAULT_VERSION, RepoKind, compute_new_tag, detect_kind, last_tag,
-    wipe_except_git,
+    BuildConfig, DEFAULT_VERSION, RepoKind, commit_msg_for_diff, compute_new_tag, detect_kind,
+    last_tag, regenerate_readme, wipe_except_git,
 };
 
 // ── build.json deserialization ─────────────────────────────────────────────
@@ -312,4 +312,129 @@ fn compute_new_tag_picks_max_across_unsorted_tags() {
     let repo = git2::Repository::open(tmp.path()).unwrap();
     // v0.10.0 is the max semver, not v0.2.0 (string-sort would mis-rank).
     assert_eq!(compute_new_tag(&repo, "patch"), "v0.10.1");
+}
+
+// ── semantic guards: empty filter must NOT silently invert into "include all"
+// ───────────────────────────────────────────────────────────────────────────
+//
+// These tests deliberately do NOT mock LM Studio. If the early-return guards
+// in `commit_msg_for_diff` and `regenerate_readme` are removed or broken, the
+// functions will attempt an HTTP call to `localhost:1234` and panic with a
+// connection error — which is what we want: the test fails loudly to surface
+// the regression. When the guards work, no HTTP call is attempted and the
+// assertions pass without LM Studio being present.
+
+#[test]
+fn commit_msg_returns_chore_update_when_commit_ignore_covers_everything() {
+    // Exact user-reported case: `commitIgnore: { glob: ["*"] }` should mean
+    // "no LLM, just a chore commit" — NOT "send the full diff to the LLM"
+    // (which libgit2 would do with no pathspecs added).
+    let tmp = init_repo_with_tags(&[]);
+    let repo = git2::Repository::open(tmp.path()).unwrap();
+    let index = repo.index().unwrap();
+    let files = vec![
+        ("Cargo.lock".to_string(), false),
+        ("src/main.rs".to_string(), false),
+        ("README.md".to_string(), false),
+    ];
+    let ignore = vec!["*".to_string()];
+    let msg = commit_msg_for_diff(&repo, &index, None, &files, Some(&ignore));
+    assert_eq!(msg, "chore: update");
+}
+
+#[test]
+fn commit_msg_returns_chore_update_when_all_files_are_binary() {
+    // No commitIgnore at all, but every staged file is binary → nothing
+    // can be fed to the model → fall back to a chore commit instead of
+    // invoking the LLM with no content.
+    let tmp = init_repo_with_tags(&[]);
+    let repo = git2::Repository::open(tmp.path()).unwrap();
+    let index = repo.index().unwrap();
+    let files = vec![
+        ("icon.png".to_string(), true),
+        ("logo.jpg".to_string(), true),
+    ];
+    let msg = commit_msg_for_diff(&repo, &index, None, &files, None);
+    assert_eq!(msg, "chore: update");
+}
+
+#[test]
+fn commit_msg_returns_chore_update_when_inventory_is_empty() {
+    // Degenerate case — caller passed no files at all.
+    let tmp = init_repo_with_tags(&[]);
+    let repo = git2::Repository::open(tmp.path()).unwrap();
+    let index = repo.index().unwrap();
+    let msg = commit_msg_for_diff(&repo, &index, None, &[], None);
+    assert_eq!(msg, "chore: update");
+}
+
+#[test]
+fn regenerate_readme_is_noop_when_globs_match_nothing() {
+    // README.md must be untouched when the readme globs don't match any
+    // tracked file. Otherwise we'd write a hallucinated README from an
+    // empty source corpus.
+    let tmp = TempDir::new().unwrap();
+    let repo = git2::Repository::init(tmp.path()).unwrap();
+    {
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.email", "test@buidl.local").unwrap();
+        cfg.set_str("user.name", "buidl-test").unwrap();
+    }
+    touch(tmp.path(), "main.rs", "fn main() {}\n");
+    touch(tmp.path(), "README.md", "ORIGINAL CONTENT — do not overwrite\n");
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("main.rs")).unwrap();
+    index.add_path(Path::new("README.md")).unwrap();
+    index.write().unwrap();
+
+    // Globs match no tracked file (no swift sources here).
+    let globs = vec!["*.swift".to_string()];
+    regenerate_readme(&repo, &mut index, &globs);
+
+    let after = fs::read_to_string(tmp.path().join("README.md")).unwrap();
+    assert_eq!(after, "ORIGINAL CONTENT — do not overwrite\n");
+}
+
+#[test]
+fn regenerate_readme_is_noop_when_glob_list_is_empty() {
+    // `readme: { glob: [] }` — degenerate but valid. README.md must stay.
+    let tmp = TempDir::new().unwrap();
+    let repo = git2::Repository::init(tmp.path()).unwrap();
+    {
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.email", "test@buidl.local").unwrap();
+        cfg.set_str("user.name", "buidl-test").unwrap();
+    }
+    touch(tmp.path(), "main.rs", "fn main() {}\n");
+    touch(tmp.path(), "README.md", "UNTOUCHED\n");
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("main.rs")).unwrap();
+    index.add_path(Path::new("README.md")).unwrap();
+    index.write().unwrap();
+
+    regenerate_readme(&repo, &mut index, &[]);
+
+    let after = fs::read_to_string(tmp.path().join("README.md")).unwrap();
+    assert_eq!(after, "UNTOUCHED\n");
+}
+
+#[test]
+fn regenerate_readme_is_noop_when_index_is_empty() {
+    // Empty repo (no tracked files at all) — there's nothing to summarize.
+    // Caller's responsibility to not even reach this, but the guard makes
+    // it safe regardless.
+    let tmp = TempDir::new().unwrap();
+    let repo = git2::Repository::init(tmp.path()).unwrap();
+    {
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.email", "test@buidl.local").unwrap();
+        cfg.set_str("user.name", "buidl-test").unwrap();
+    }
+    let mut index = repo.index().unwrap();
+
+    // Don't touch a README at all; just confirm regen doesn't panic / create one.
+    let globs = vec!["*.rs".to_string()];
+    regenerate_readme(&repo, &mut index, &globs);
+
+    assert!(!tmp.path().join("README.md").exists());
 }

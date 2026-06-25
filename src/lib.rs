@@ -224,6 +224,15 @@ pub fn regenerate_readme(
     let paths: Vec<String> = select_readme_paths(&all_paths, globs)
         .into_iter().map(str::to_string).collect();
 
+    // Short-circuit: no source files matched. Asking the model to invent a
+    // README from nothing would just produce hallucinated content and then
+    // we'd commit it. Treat as a no-op — caller's `readme.glob` configured
+    // the regen out for this run, intentionally or not.
+    if paths.is_empty() {
+        eprintln!("[buidl] README regen: 0 files matched globs {globs:?}; skipping");
+        return;
+    }
+
     let mut sections: Vec<String> = Vec::with_capacity(paths.len());
     let mut included: Vec<(String, usize)> = Vec::with_capacity(paths.len());
     for path in &paths {
@@ -398,8 +407,22 @@ pub fn commit_msg_for_diff(
     files: &[(String, bool)],
     ignore_globs: Option<&[String]>,
 ) -> String {
+    // Short-circuit: if every file is binary or matches commitIgnore, the
+    // filtered diff would be empty. Two semantic problems if we proceed:
+    // (a) libgit2 treats "no pathspecs added" as "include EVERY path", which
+    //     would silently feed the model the full diff — the OPPOSITE of what
+    //     `commitIgnore: ["*"]` is meant to do;
+    // (b) even with an actually-empty diff, asking the model to summarize
+    //     nothing produces nonsense. Fall back to a hardcoded chore commit.
+    let paths = select_commit_paths(files, ignore_globs);
+    if paths.is_empty() {
+        eprintln!(
+            "[buidl] no files reach the commit-message LLM (binary + commitIgnore covered everything); using `chore: update`"
+        );
+        return "chore: update".to_string();
+    }
     let mut opts = git2::DiffOptions::new();
-    for path in select_commit_paths(files, ignore_globs) {
+    for path in &paths {
         opts.pathspec(path);
     }
     let filtered = repo.diff_tree_to_index(head_tree, Some(index), Some(&mut opts))
