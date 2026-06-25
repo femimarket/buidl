@@ -77,6 +77,19 @@ fn main() {
         let bump = buidl::bump_kind(&commit_msg);
         let new_tag = buidl::compute_new_tag(&repo, bump);
 
+        // For openapi entries, openapi-generator baked `last_tag` into
+        // version markers (package.json, README.md, build.gradle.kts).
+        // Rewrite those to the NEW tag so HEAD and tag stay in sync —
+        // otherwise every subsequent run sees a `LAST → NEW` diff in
+        // package.json and bumps again, forever.
+        if entry.kind.as_deref() == Some("openapi") {
+            buidl::sync_openapi_versions(kind, path, &new_tag);
+            index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+                .unwrap_or_else(|e| panic!("re-staging after sync_openapi_versions: {e}"));
+            index.write()
+                .unwrap_or_else(|e| panic!("writing index after sync_openapi_versions: {e}"));
+        }
+
         // README regen is opt-in via the `readme` field. Absent → skip
         // entirely. Present → regen using only files whose path matches one
         // of `readme.glob`. The new README joins this same commit via
