@@ -1,178 +1,194 @@
 # buidl
 
-**buidl** is a JSON-driven build orchestrator for automated release management. It automates the "stage → diff → commit → tag → push" lifecycle for multiple repositories defined in a single configuration file.
+`buidl` is a JSON-driven build orchestrator for Rust, Swift, Kotlin, Android, JavaScript, and generic repositories. It automates the release pipeline: detecting language, generating Conventional Commits messages via a local LLM, bumping semver tags, regenerating READMEs, pushing to GitHub, and optionally publishing to GitHub Packages or creating GitHub Releases.
 
-Key features:
-- **Auto-detection**: Automatically detects repository languages (Rust, Swift, Kotlin, Android, JS, Generic) based on file signatures.
-- **LLM-Powered**: Uses a local LM Studio instance to generate Conventional Commits messages and regenerate `README.md` files from source code.
-- **OpenAPI Integration**: Supports `kind: "openapi"` entries to wipe directories, run `openapi-generator`, and sync version markers across generated clients.
-- **Semantic Versioning**: Automatically calculates semver bumps (major/minor/patch) based on commit message types (`feat`, `fix`, `BREAKING CHANGE`, etc.).
-- **Gradle Publishing**: Automatically publishes Android and Kotlin Multiplatform artifacts to GitHub Packages.
+It is designed for a "local is prod" workflow where `buidl` manages multiple local git checkouts defined in a single `build.json` configuration file.
+
+## Features
+
+- **Language Auto-Detection**: Automatically identifies Swift, Kotlin, Android, JS, Rust, or Generic repos based on build files (`Cargo.toml`, `Package.swift`, `build.gradle.kts`, `package.json`).
+- **LLM-Driven Commits**: Uses a local LM Studio instance to generate Conventional Commits messages from staged diffs.
+- **LLM-Driven READMEs**: Optionally regenerates `README.md` from source code using a local LLM.
+- **OpenAPI Code Generation**: Supports `kind: "openapi"` entries to wipe a repo, fetch an OpenAPI spec, run `openapi-generator`, and sync version markers.
+- **Automated Semver Bumping**: Computes new tags based on commit types (`feat` → minor, `fix` → patch, `!`/BREAKING → major).
+- **GitHub Integration**: Pushes code, tags, and optionally creates GitHub Releases with assets.
+- **Gradle Publishing**: Automatically publishes Android/Kotlin libraries to GitHub Packages.
 
 ## Prerequisites
 
-- **Rust Toolchain**: `cargo` (Edition 2024).
-- **Git**: Installed and configured with user identity (`user.name`, `user.email`).
-- **LM Studio**: Running locally on `http://localhost:1234`.
-  - The tool expects a model named `qwen/qwen3.6-35b-a3b` (or compatible).
-  - Ensure the LM Studio server is accessible at the default API endpoint.
-- **OpenAPI Generator** (Optional): Required only if `build.json` contains entries with `kind: "openapi"`.
-- **Gradle** (Optional): Required for `Android` and `Kotlin` repos to publish to GitHub Packages.
+- **Rust Toolchain**: To build `buidl`.
+- **Git**: Installed and configured.
+- **LM Studio**: Running locally on `http://localhost:1234` with a compatible model (e.g., `qwen/qwen3.6-35b-a3b`).
+- **OpenAPI Generator**: Installed on PATH (`openapi-generator`) if using `kind: "openapi"`.
+- **GitHub CLI (`gh`)**: Installed and authenticated if using `release` assets.
+- **Gradle**: Installed if using `kind: "openapi"` with Kotlin templates or `RepoKind::Android`/`Kotlin` publishing.
+
+## Installation
+
+```bash
+git clone <repository-url>
+cd buidl
+cargo build --release
+```
 
 ## Configuration
 
-The pipeline is driven by a single JSON file, defaulting to `build.json`.
+`buidl` is driven by a `build.json` file (default: `./build.json`). It accepts a list of repository entries.
 
 ### Structure
-
-`build.json` is an array of `Entry` objects. Each object represents a repository to process.
 
 ```json
 [
   {
-    "path": "/path/to/local/repo",
-    "remote": "https://github.com/user/repo.git",
+    "path": "/absolute/path/to/repo",
+    "remote": "https://github.com/user/repo",
     "kind": "openapi",
     "data": {
-      "templates": "/path/to/templates/swift6",
+      "templates": "/path/to/templates",
       "deleteAllExceptGit": true
     },
     "readme": {
-      "glob": ["*.swift", "Sources/**/*.swift"]
+      "glob": ["*.swift", "Sources/**/*.kt"]
     },
     "commitIgnore": {
       "glob": ["*.lock", "dist/**"]
-    }
-  },
-  {
-    "path": "/path/to/another/repo",
-    "readme": {
-      "glob": ["*.rs", "*.toml"]
     },
-    "commitIgnore": {
-      "glob": ["*.lock"]
+    "release": {
+      "glob": ["dist/*.bin", "artifacts/*.tar.gz"]
     }
   }
 ]
 ```
 
-### Entry Fields
+### Fields
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path` | `string` | Yes | Local filesystem path to the git repository. |
-| `remote` | `string` | No | Informational only. The actual push URL is derived from the repo's existing git config. |
-| `kind` | `string` | No | If `"openapi"`, triggers a pre-wipe and `openapi-generator` pass before the standard commit flow. |
-| `data` | `object` | Conditional | Required if `kind` is `"openapi"`. Contains `templates` (path to generator templates) and `deleteAllExceptGit` (boolean). |
-| `readme` | `object` | No | Opt-in for LLM-generated README regeneration. Contains `glob` (array of glob patterns). If absent, README is not touched. |
-| `commitIgnore` | `object` | No | Excludes files from the commit-message LLM prompt. Contains `glob` (array of glob patterns). Useful for excluding lockfiles or generated noise. |
+- **`path`** (required): Absolute path to the local git repository.
+- **`remote`** (optional): Informational only. The actual push URL is derived from the repo's git config.
+- **`kind`** (optional):
+  - `"openapi"`: Triggers a pre-wipe, spec fetch, and `openapi-generator` pass before the standard commit flow. Requires `data` field.
+  - Absent or other: Standard commit/README/push/tag flow.
+- **`data`** (required if `kind: "openapi"`):
+  - `templates`: Path to the openapi-generator templates directory.
+  - `deleteAllExceptGit`: If `true`, wipes the repo directory (except `.git/`) before generation.
+- **`readme`** (optional):
+  - `glob`: List of glob patterns. Only files matching these patterns are fed to the LLM for README regeneration. If absent, README regeneration is skipped.
+- **`commitIgnore`** (optional):
+  - `glob`: List of glob patterns. Files matching these are excluded from the commit-message LLM prompt (e.g., to exclude lockfiles).
+- **`release`** (optional):
+  - `glob`: List of glob patterns for assets to attach to the GitHub Release.
 
 ### Glob Semantics
 
-Glob patterns use `glob` crate semantics with `require_literal_separator: true`.
-- **Unanchored** (no `/`): Matches anywhere in the path (e.g., `*.swift` matches `foo.swift` and `Sources/foo.swift`).
-- **Anchored** (contains `/`): Matches exactly (e.g., `Sources/*.swift` matches only direct children of `Sources/`).
+- Patterns without `/` (e.g., `*.swift`) match anywhere in the repo.
+- Patterns with `/` (e.g., `Sources/*.swift`) match exactly as specified.
+- `**` matches recursively.
 
 ## Usage
 
-### Running the Pipeline
+### Running
 
 ```bash
 # Use default build.json
-cargo run --release
+./target/release/buidl
 
-# Use a custom config file
-cargo run --release -- --config my-build.json
+# Use custom config
+./target/release/buidl --config /path/to/build.json
 ```
 
-### Workflow per Entry
+### Workflow
 
-For each entry in `build.json`, `buidl` performs the following steps:
+For each entry in `build.json`:
 
-1. **OpenAPI Pre-processing** (if `kind: "openapi"`):
-   - Reads the last existing tag.
-   - Wipes the directory (except `.git/`) if `deleteAllExceptGit` is true.
-   - Runs `openapi-generator` using the specified templates.
+1. **OpenAPI Setup** (if `kind: "openapi"`):
+   - Fetches the OpenAPI spec from `https://localhost:443/api-docs/openapi.json` (hardcoded in `src/lib.rs`).
+   - Wipes the repo (if `deleteAllExceptGit: true`).
+   - Runs `openapi-generator` with the specified templates.
    - Syncs version markers in generated files (`package.json`, `build.gradle.kts`, `README.md`) to match the new tag.
 
-2. **Auto-Detection**:
-   - Detects `RepoKind` (Rust, Swift, Kotlin, Android, JS, Generic) based on file signatures (`Cargo.toml`, `Package.swift`, `build.gradle.kts`, `package.json`, etc.).
-
-3. **Staging & Diffing**:
-   - Stages all changes in the working directory.
+2. **Stage & Diff**:
+   - Stages all changes.
    - Computes the diff against HEAD.
-   - If no changes exist, skips the entry.
+   - If no changes, skips the entry.
 
-4. **Commit Message Generation**:
-   - Filters staged files: excludes binary files and those matching `commitIgnore.glob`.
-   - Sends the filtered diff to LM Studio to generate a Conventional Commits message.
-   - If no files reach the LLM (e.g., all ignored/binary), defaults to `chore: update`.
+3. **Commit Message**:
+   - Filters out binary files and `commitIgnore` globs.
+   - Sends the diff to LM Studio to generate a Conventional Commits message.
+   - Validates the message format.
 
-5. **Version Calculation**:
-   - Parses the commit message to determine bump type (`major`, `minor`, `patch`).
-   - Calculates the new tag (e.g., `v1.2.3` → `v1.2.4` for patch).
+4. **Version Bump**:
+   - Computes the new semver tag based on the commit type (`feat` → minor, `fix` → patch, `!` → major).
 
-6. **README Regeneration** (if `readme` field is present):
+5. **README Regeneration** (if `readme` field present):
    - Filters tracked files by `readme.glob`.
-   - Excludes `README.md` itself to prevent anchoring.
-   - Sends source content to LM Studio to generate a fresh README.
-   - Re-stages the new `README.md`.
+   - Sends source code to LM Studio to generate a fresh `README.md`.
+   - Stages the new README.
 
-7. **Commit & Push**:
+6. **Commit & Push**:
    - Creates a commit with the generated message.
-   - Pushes to `origin/main`.
-   - Creates and pushes the new lightweight tag.
+   - Pushes to `origin main`.
+   - Creates and pushes the new tag.
 
-8. **Artifact Publishing** (if applicable):
-   - For `Android` and `Kotlin` repos: Runs `./gradlew publishAllPublicationsToGitHubPackagesRepository`.
-   - For others: The git tag is considered the artifact.
+7. **Publishing**:
+   - **Android/Kotlin**: Runs `./gradlew publishAllPublicationsToGitHubPackagesRepository`.
+   - **Swift/Rust/JS/Generic**: No extra step; the tag is the artifact.
+
+8. **GitHub Release** (if `release` field present):
+   - Creates a GitHub Release with the new tag.
+   - Uploads assets matching `release.glob`.
 
 ## Architecture
 
 ### Key Files
 
-- **`src/main.rs`**: CLI entry point. Parses `build.json`, iterates over entries, and orchestrates the pipeline steps.
+- **`src/main.rs`**: CLI entry point. Parses `build.json`, iterates over entries, and orchestrates the pipeline.
 - **`src/lib.rs`**: Core logic.
-  - **`detect_kind`**: Inspects filesystem to determine language.
-  - **`commit_msg_for_diff`**: Interfaces with LM Studio for commit messages.
-  - **`regenerate_readme`**: Interfaces with LM Studio for README generation.
-  - **`compute_new_tag` / `bump_kind`**: Semver logic.
-  - **`run_openapi_generator_for_templates`**: Spawns the `openapi-generator` CLI.
-  - **`sync_openapi_versions`**: Post-processing to fix version strings in generated code.
-- **`tests/integration.rs`**: End-to-end tests using temporary directories and real git repositories.
+  - `detect_kind`: Auto-detects language from build files.
+  - `commit_msg_for_diff`: Interfaces with LM Studio for commit messages.
+  - `regenerate_readme`: Interfaces with LM Studio for README generation.
+  - `compute_new_tag`: Semver bumping logic.
+  - `run_openapi_generator_for_templates`: Spawns `openapi-generator`.
+  - `sync_openapi_versions`: Patches version strings in generated files.
+  - `gh_release_create`: Spawns `gh release create`.
+  - `gradle_publish_github_packages`: Spawns `gradlew`.
 
-### Non-Obvious Conventions
+### LLM Integration
 
-1. **LM Studio Dependency**: The tool assumes a local LM Studio instance. If it's not running, the tool will panic with a connection error.
-2. **Binary File Handling**: Binary files are always excluded from LLM prompts. They are staged and committed but not analyzed.
-3. **Commit Message Validation**: The tool validates that the LLM returns a valid Conventional Commits header. If the format is invalid, the tool panics rather than committing garbage.
-4. **OpenAPI Version Sync**: For `openapi` entries, the tool explicitly rewrites version strings in generated files (`package.json`, `build.gradle.kts`) to match the new tag. This prevents infinite version-bump loops caused by the generator seeding with the *previous* tag.
-5. **Gradle Wrapper Patching**: For Kotlin multiplatform generators, the tool automatically patches `gradlew` permissions and updates `gradle-wrapper.properties` to use a compatible Gradle version (9.1.0) to avoid JDK 25 compatibility issues.
-6. **Default Version**: If no tags exist, the tool uses `v0.1.0` as the starting version.
+`buidl` communicates with LM Studio via HTTP POST to `http://localhost:1234/v1/chat/completions`.
 
-### Error Handling
+- **Model**: `qwen/qwen3.6-35b-a3b` (hardcoded).
+- **Timeout**: 30 minutes (1800 seconds) to accommodate large diffs.
+- **Temperature**: 0.2 for deterministic output.
+- **Prompt Engineering**:
+  - Commit messages: Prompt includes the unified diff. Excludes binary files and `commitIgnore` globs.
+  - READMEs: Prompt includes file contents of files matching `readme.glob`. Excludes the existing `README.md` to prevent anchoring.
 
-- **Git Errors**: Panics if git operations fail (e.g., push failure, tag creation failure).
-- **LLM Errors**: Panics if the LLM returns an empty response or invalid format.
-- **OpenAPI Errors**: Panics if `openapi-generator` fails or if templates are missing.
+### OpenAPI Generator
 
-## Development
+- **Spec Source**: `https://localhost:443/api-docs/openapi.json` (hardcoded in `src/lib.rs::SPEC`).
+- **Templates**: Supported templates are inferred from the `templates` path:
+  - `swift6`: Swift 6 client.
+  - `typescript-fetch`: TypeScript/JS client.
+  - `multiplatform` (under `libraries/`): Kotlin Multiplatform client.
+- **Version Sync**: To prevent infinite version bumps, `buidl` syncs the new tag version into generated files (`package.json`, `build.gradle.kts`, `README.md`) after generation.
 
-### Running Tests
+## Testing
 
 ```bash
 cargo test
 ```
 
-### Building
+Tests cover:
+- Pure functions (`bump_kind`, `matches_any_glob`, `select_commit_paths`, etc.).
+- JSON deserialization.
+- Filesystem operations (`detect_kind`, `wipe_except_git`).
+- Git operations (`last_tag`, `compute_new_tag`) using temp repositories.
+- LLM guardrails (ensuring empty diffs/globs don't trigger LLM calls).
 
-```bash
-cargo build --release
-```
+## Non-Obvious Conventions
 
-### Adding New Language Support
-
-To add support for a new language:
-1. Update `RepoKind` enum in `src/lib.rs`.
-2. Update `detect_kind` to check for new file signatures.
-3. Update the publish logic in `src/main.rs` if the new language requires a specific publish step (like Gradle).
+- **Binary Files**: Always excluded from LLM prompts.
+- **Commit Message Validation**: If the LLM returns a non-Conventional Commits message, `buidl` panics.
+- **Empty Diff**: If all staged files are binary or ignored, `buidl` uses a hardcoded `chore: update` commit message.
+- **README Regeneration**: If no files match `readme.glob`, the existing README is left untouched.
+- **OpenAPI Version Sync**: Critical for preventing drift between the generated code's version and the git tag.
+- **Gradle Wrapper Patching**: For Kotlin multiplatform, `buidl` patches the generated `gradlew` permissions and `gradle-wrapper.properties` to ensure compatibility with newer JDKs.

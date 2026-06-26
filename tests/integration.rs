@@ -77,6 +77,37 @@ fn build_config_parses_full_buidl_entry_shape() {
 }
 
 #[test]
+fn build_config_parses_release_with_glob() {
+    // The exact shape the user wants for SwiftLyricEditor: optional release
+    // field with asset globs that get uploaded to the just-pushed tag.
+    let cfg: BuildConfig = serde_json::from_str(r#"
+        [{
+            "path":"/Users/u/swiftapps/LyricEditor",
+            "remote":"https://github.com/femimarket/SwiftLyricEditor",
+            "readme":{"glob":["*.swift"]},
+            "release":{"glob":["qwen3-aligner-0.6b"]}
+        }]
+    "#).unwrap();
+    let rel = cfg[0].release.as_ref().expect("release field parsed");
+    assert_eq!(rel.glob, vec!["qwen3-aligner-0.6b".to_string()]);
+}
+
+#[test]
+fn build_config_release_absent_yields_none() {
+    let cfg: BuildConfig = serde_json::from_str(r#"[{"path":"/foo"}]"#).unwrap();
+    assert!(cfg[0].release.is_none());
+}
+
+#[test]
+fn build_config_parses_release_with_multiple_asset_globs() {
+    let cfg: BuildConfig = serde_json::from_str(r#"
+        [{"path":"/foo","release":{"glob":["dist/*.bin","artifacts/*.tar.gz"]}}]
+    "#).unwrap();
+    let rel = cfg[0].release.as_ref().unwrap();
+    assert_eq!(rel.glob, vec!["dist/*.bin".to_string(), "artifacts/*.tar.gz".to_string()]);
+}
+
+#[test]
 fn build_config_parses_openapi_entry_full_shape() {
     let cfg: BuildConfig = serde_json::from_str(r#"
         [{

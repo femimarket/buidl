@@ -38,6 +38,8 @@ pub struct Entry {
     pub readme: Option<ReadmeConfig>,
     #[serde(default, rename = "commitIgnore")]
     pub commit_ignore: Option<CommitIgnore>,
+    #[serde(default)]
+    pub release: Option<ReleaseConfig>,
 }
 
 /// Per-entry knobs consumed when `kind == "openapi"`.
@@ -70,6 +72,19 @@ pub struct ReadmeConfig {
 /// dep churn out of the prompt.
 #[derive(Deserialize, Default)]
 pub struct CommitIgnore {
+    #[serde(default)]
+    pub glob: Vec<String>,
+}
+
+/// Assets to attach to a GitHub release tied to the just-pushed tag. Each
+/// `glob` is expanded via the `glob` crate; absolute paths are taken
+/// as-is, relative paths are resolved against the entry's repo dir.
+///
+/// `release` is only honored when the canonical flow actually cuts a new
+/// tag — runs that exit with "Nothing to release" never reach the gh step.
+/// Requires the `gh` CLI on PATH and an authenticated session.
+#[derive(Deserialize, Default)]
+pub struct ReleaseConfig {
     #[serde(default)]
     pub glob: Vec<String>,
 }
@@ -185,7 +200,7 @@ fn detect_gradle(path: &Path) -> Option<RepoKind> {
         }
     }
     if found_gradle {
-        // gradle file exists but neither marker — best guess is kotlin
+        // gradle file exists buthttps://localhost/api-docs/openapi.json neither marker — best guess is kotlin
         // multiplatform since plain kotlin/jvm projects are rare here.
         return Some(RepoKind::Kotlin);
     }
@@ -194,11 +209,40 @@ fn detect_gradle(path: &Path) -> Option<RepoKind> {
 
 /// Upstream API spec consumed by every openapi-kind entry. Hardcoded for now;
 /// move to build.json's top level if/when a second spec source shows up.
-pub const SPEC: &str = "http://localhost:80/api-docs/openapi.json";
+pub const SPEC: &str = "https://localhost:443/api-docs/openapi.json";
+
+/// Local path used by `fetch_spec_to_tmp` to drop the fetched spec. Stable
+/// path so repeated runs overwrite the same file rather than littering /tmp.
+pub const SPEC_LOCAL_PATH: &str = "/tmp/buidl-spec.json";
 
 /// First tag a release cuts when no tag exists yet. Pre-1.0 signals the API
 /// isn't stable — bump major to 1.0.0 when you'd feel bad breaking it.
 pub const DEFAULT_VERSION: &str = "v0.1.0";
+
+/// Fetch the OpenAPI spec from `url` and write it to `SPEC_LOCAL_PATH`. The
+/// reqwest client is configured with `danger_accept_invalid_certs(true)` so
+/// self-signed certs on `https://localhost/...` (the "local is prod" setup)
+/// don't blow up — `openapi-generator` would otherwise fail with a Java SSL
+/// error trying to read the URL directly. Returns the local path as a
+/// `String` for easy plumbing into the generator's `-i` arg.
+pub fn fetch_spec_to_tmp(url: &str) -> String {
+    let client = reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|e| panic!("building reqwest client for spec fetch: {e}"));
+    let bytes = client.get(url)
+        .send()
+        .unwrap_or_else(|e| panic!("GET {url}: {e}"))
+        .error_for_status()
+        .unwrap_or_else(|e| panic!("spec fetch HTTP error from {url}: {e}"))
+        .bytes()
+        .unwrap_or_else(|e| panic!("reading spec body from {url}: {e}"));
+    std::fs::write(SPEC_LOCAL_PATH, &bytes)
+        .unwrap_or_else(|e| panic!("writing spec to {SPEC_LOCAL_PATH:?}: {e}"));
+    eprintln!("[buidl] spec fetched: {} bytes → {}", bytes.len(), SPEC_LOCAL_PATH);
+    SPEC_LOCAL_PATH.to_string()
+}
 
 /// Read every tracked file, ask LM Studio to regenerate README.md from the
 /// whole codebase, write it, and re-stage. The existing README is skipped so
@@ -778,6 +822,68 @@ fn sync_kotlin_version(path: &Path, version: &str) {
     }
 }
 
+/// Expand each `glob` in `globs` to a list of files on disk. Absolute paths
+/// are passed straight through to the `glob` crate; relative paths are
+/// resolved against `repo_path` first. A pattern with no wildcards still
+/// works — it just matches the literal file if it exists, otherwise yields
+/// nothing. Extracted from `gh_release_create` so it's unit-testable
+/// without spawning a process.
+pub fn expand_release_assets(repo_path: &Path, globs: &[String]) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for g in globs {
+        let pat_path = Path::new(g);
+        let full: String = if pat_path.is_absolute() {
+            g.clone()
+        } else {
+            repo_path.join(g).to_string_lossy().into_owned()
+        };
+        let entries = glob::glob(&full)
+            .unwrap_or_else(|e| panic!("invalid release glob {full:?}: {e}"));
+        for entry in entries {
+            let p = entry.unwrap_or_else(|e| panic!("globbing release asset under {repo_path:?}: {e}"));
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Build the argv for `gh release create`. Separated so the exact CLI
+/// invocation is testable without an authenticated `gh`. Uses
+/// `--generate-notes` to auto-populate the body from commits since the
+/// previous tag, and `--title <tag>` so the release page header matches
+/// the tag name.
+pub fn build_gh_release_args(tag: &str, assets: &[std::path::PathBuf]) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "release".to_string(),
+        "create".to_string(),
+        tag.to_string(),
+        "--title".to_string(),
+        tag.to_string(),
+        "--generate-notes".to_string(),
+    ];
+    for a in assets {
+        args.push(a.to_string_lossy().into_owned());
+    }
+    args
+}
+
+/// Run `gh release create <tag> [assets…] --title <tag> --generate-notes`
+/// in `cwd`. Requires `gh` on PATH and an authenticated session. Asset
+/// globs are expanded via `expand_release_assets`.
+pub fn gh_release_create(cwd: &Path, tag: &str, asset_globs: &[String]) {
+    let assets = expand_release_assets(cwd, asset_globs);
+    println!("📦 Creating GitHub release {tag} with {} asset(s)", assets.len());
+    let args = build_gh_release_args(tag, &assets);
+    let status = Command::new("gh")
+        .args(&args)
+        .current_dir(cwd)
+        .status()
+        .unwrap_or_else(|e| panic!("spawning `gh {}` in {cwd:?}: {e}", args.join(" ")));
+    if !status.success() {
+        panic!("`gh {}` in {cwd:?} failed with {status}", args.join(" "));
+    }
+}
+
 /// `./gradlew publishAllPublicationsToGitHubPackagesRepository
 /// -PlibraryVersion=<version>` in `cwd`. Used for android apps and kotlin
 /// multiplatform libraries that publish to GitHub Packages.
@@ -1136,5 +1242,129 @@ mod tests {
 
         let after = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
         assert_eq!(after, cargo);
+    }
+
+    // ── expand_release_assets ──────────────────────────────────────────────
+
+    #[test]
+    fn expand_release_assets_resolves_literal_relative_path() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("artifact.bin"), b"data").unwrap();
+        let globs = vec!["artifact.bin".to_string()];
+
+        let assets = expand_release_assets(tmp.path(), &globs);
+
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].file_name().unwrap(), "artifact.bin");
+        assert!(assets[0].is_absolute(), "globbed path is absolute on disk");
+    }
+
+    #[test]
+    fn expand_release_assets_expands_wildcard_glob() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("foo.bin"), b"a").unwrap();
+        std::fs::write(tmp.path().join("bar.bin"), b"b").unwrap();
+        std::fs::write(tmp.path().join("baz.txt"), b"c").unwrap();
+        let globs = vec!["*.bin".to_string()];
+
+        let mut names: Vec<String> = expand_release_assets(tmp.path(), &globs)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+
+        assert_eq!(names, vec!["bar.bin".to_string(), "foo.bin".to_string()]);
+    }
+
+    #[test]
+    fn expand_release_assets_handles_absolute_path() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("artifact.bin"), b"data").unwrap();
+        // Absolute pattern — repo_path is irrelevant.
+        let abs = tmp.path().join("artifact.bin").to_string_lossy().into_owned();
+        let globs = vec![abs.clone()];
+
+        let assets = expand_release_assets(Path::new("/var"), &globs);
+
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0], std::path::PathBuf::from(abs));
+    }
+
+    #[test]
+    fn expand_release_assets_yields_empty_when_nothing_matches() {
+        let tmp = TempDir::new().unwrap();
+        let globs = vec!["nonexistent-*.bin".to_string()];
+
+        let assets = expand_release_assets(tmp.path(), &globs);
+
+        assert!(assets.is_empty());
+    }
+
+    #[test]
+    fn expand_release_assets_multiple_globs_combined() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.bin"), b"a").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), b"b").unwrap();
+        let globs = vec!["*.bin".to_string(), "*.txt".to_string()];
+
+        let mut names: Vec<String> = expand_release_assets(tmp.path(), &globs)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+
+        assert_eq!(names, vec!["a.bin".to_string(), "b.txt".to_string()]);
+    }
+
+    #[test]
+    fn expand_release_assets_recurses_with_double_star() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("dist/sub")).unwrap();
+        std::fs::write(tmp.path().join("dist/sub/inner.bin"), b"x").unwrap();
+        std::fs::write(tmp.path().join("dist/top.bin"), b"y").unwrap();
+        let globs = vec!["dist/**/*.bin".to_string()];
+
+        let mut paths: Vec<String> = expand_release_assets(tmp.path(), &globs)
+            .into_iter()
+            .map(|p| {
+                // Just compare relative-to-tmp for stability.
+                p.strip_prefix(tmp.path()).unwrap().to_string_lossy().into_owned()
+            })
+            .collect();
+        paths.sort();
+
+        assert_eq!(
+            paths,
+            vec!["dist/sub/inner.bin".to_string(), "dist/top.bin".to_string()],
+        );
+    }
+
+    // ── build_gh_release_args ──────────────────────────────────────────────
+
+    #[test]
+    fn build_gh_release_args_no_assets() {
+        let args = build_gh_release_args("v1.0.0", &[]);
+        // Must start with `release create <tag>` — that's the gh CLI shape.
+        assert_eq!(args[0], "release");
+        assert_eq!(args[1], "create");
+        assert_eq!(args[2], "v1.0.0");
+        // Title and generate-notes are required for non-interactive use.
+        assert!(args.contains(&"--title".to_string()));
+        assert!(args.contains(&"v1.0.0".to_string()));  // both as tag and as title
+        assert!(args.contains(&"--generate-notes".to_string()));
+    }
+
+    #[test]
+    fn build_gh_release_args_with_assets_appends_paths() {
+        let assets = vec![
+            std::path::PathBuf::from("/tmp/a.bin"),
+            std::path::PathBuf::from("/tmp/b.bin"),
+        ];
+        let args = build_gh_release_args("v1.2.3", &assets);
+        assert_eq!(args[0], "release");
+        assert_eq!(args[1], "create");
+        assert_eq!(args[2], "v1.2.3");
+        assert!(args.iter().any(|a| a == "/tmp/a.bin"));
+        assert!(args.iter().any(|a| a == "/tmp/b.bin"));
     }
 }

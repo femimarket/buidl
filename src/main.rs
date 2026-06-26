@@ -120,6 +120,14 @@ fn main() {
             }
         }
 
+        // Optional GitHub release tied to the tag we just pushed. Only fires
+        // when the canonical flow actually cut a new tag (no-op runs exit at
+        // the empty-diff guard above). Asset globs in `release.glob` are
+        // expanded relative to the repo dir and uploaded as release assets.
+        if let Some(release_cfg) = &entry.release {
+            buidl::gh_release_create(path, &new_tag, &release_cfg.glob);
+        }
+
         println!("✅ Successfully pushed {new_tag} to GitHub!");
     }
 }
