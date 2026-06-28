@@ -219,31 +219,6 @@ pub const SPEC_LOCAL_PATH: &str = "/tmp/buidl-spec.json";
 /// isn't stable — bump major to 1.0.0 when you'd feel bad breaking it.
 pub const DEFAULT_VERSION: &str = "v0.1.0";
 
-/// Fetch the OpenAPI spec from `url` and write it to `SPEC_LOCAL_PATH`. The
-/// reqwest client is configured with `danger_accept_invalid_certs(true)` so
-/// self-signed certs on `https://localhost/...` (the "local is prod" setup)
-/// don't blow up — `openapi-generator` would otherwise fail with a Java SSL
-/// error trying to read the URL directly. Returns the local path as a
-/// `String` for easy plumbing into the generator's `-i` arg.
-pub fn fetch_spec_to_tmp(url: &str) -> String {
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(30))
-        .build()
-        .unwrap_or_else(|e| panic!("building reqwest client for spec fetch: {e}"));
-    let bytes = client.get(url)
-        .send()
-        .unwrap_or_else(|e| panic!("GET {url}: {e}"))
-        .error_for_status()
-        .unwrap_or_else(|e| panic!("spec fetch HTTP error from {url}: {e}"))
-        .bytes()
-        .unwrap_or_else(|e| panic!("reading spec body from {url}: {e}"));
-    std::fs::write(SPEC_LOCAL_PATH, &bytes)
-        .unwrap_or_else(|e| panic!("writing spec to {SPEC_LOCAL_PATH:?}: {e}"));
-    eprintln!("[buidl] spec fetched: {} bytes → {}", bytes.len(), SPEC_LOCAL_PATH);
-    SPEC_LOCAL_PATH.to_string()
-}
-
 /// Read every tracked file, ask LM Studio to regenerate README.md from the
 /// whole codebase, write it, and re-stage. The existing README is skipped so
 /// the model doesn't anchor to it. Binary blobs are silently skipped (can't
