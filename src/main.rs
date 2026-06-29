@@ -59,6 +59,10 @@ fn main() {
             buidl::ensure_remote(&repo, remote_url);
         }
 
+        if matches!(kind, RepoKind::Swift) {
+            buidl::ensure_swift_gitignore(&repo);
+        }
+
         let mut index = buidl::stage_all(&repo);
         let (head_tree, files) = buidl::diff_files(&repo, &index);
         if files.is_empty() {

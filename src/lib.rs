@@ -355,6 +355,82 @@ pub fn lm(prompt: &str) -> String {
     message
 }
 
+/// Lines we want in any Swift project's `.gitignore`. `.build/` and `.swiftpm/`
+/// matter for staging — both contain nested git repos (SPM dependency checkouts
+/// and the SPM workspace state) that libgit2's `add_all` errors on. The
+/// `xcuserdata/` patterns matter for safety — schemes there can carry launch
+/// args / env vars, which is where secrets tend to leak in.
+pub const SWIFT_GITIGNORE_LINES: &[&str] = &[
+    ".build/",
+    ".swiftpm/",
+    "DerivedData/",
+    "build/",
+    "xcuserdata/",
+    "*.xcuserdatad/",
+    ".DS_Store",
+];
+
+/// True if any path component matches a Swift-ignore name. Mirrors what the
+/// `SWIFT_GITIGNORE_LINES` directory patterns express (sans-leading-slash
+/// gitignore patterns match the basename anywhere in the tree).
+fn path_matches_swift_ignores(path: &std::path::Path) -> bool {
+    for comp in path.components() {
+        if let std::path::Component::Normal(os) = comp {
+            if let Some(s) = os.to_str() {
+                match s {
+                    ".build" | ".swiftpm" | "DerivedData" | "build" | "xcuserdata" | ".DS_Store" => return true,
+                    _ if s.ends_with(".xcuserdatad") => return true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
+/// For Swift entries: append any missing `SWIFT_GITIGNORE_LINES` to the repo's
+/// `.gitignore` (creating the file if absent, preserving whatever's there), AND
+/// untrack any already-committed files that now match those ignore rules — a
+/// pure `.gitignore` edit has no effect on files already in the index.
+pub fn ensure_swift_gitignore(repo: &git2::Repository) {
+    use std::collections::HashSet;
+    let path = repo.workdir()
+        .unwrap_or_else(|| panic!("ensure_swift_gitignore: repo has no workdir"));
+
+    let gi = path.join(".gitignore");
+    let existing = std::fs::read_to_string(&gi).unwrap_or_default();
+    let have: HashSet<&str> = existing.lines().map(|l| l.trim()).collect();
+    let missing: Vec<&str> = SWIFT_GITIGNORE_LINES.iter().copied()
+        .filter(|l| !have.contains(l)).collect();
+    if !missing.is_empty() {
+        let mut out = existing.clone();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        for line in &missing {
+            out.push_str(line);
+            out.push('\n');
+        }
+        std::fs::write(&gi, out)
+            .unwrap_or_else(|e| panic!("writing .gitignore at {}: {e}", gi.display()));
+        println!("[buidl] added {} swift .gitignore line(s): {}", missing.len(), missing.join(", "));
+    }
+
+    let mut index = repo.index().expect("getting index");
+    let to_untrack: Vec<std::path::PathBuf> = index.iter()
+        .map(|e| std::path::PathBuf::from(String::from_utf8_lossy(&e.path).into_owned()))
+        .filter(|p| path_matches_swift_ignores(p))
+        .collect();
+    if !to_untrack.is_empty() {
+        for p in &to_untrack {
+            index.remove_path(p)
+                .unwrap_or_else(|e| panic!("untracking {}: {e}", p.display()));
+        }
+        index.write().expect("writing index after untracking ignored files");
+        println!("[buidl] untracked {} previously-committed ignored file(s)", to_untrack.len());
+    }
+}
+
 /// If the repo has no `origin` remote, set it to `url`. Existing remote left
 /// alone — no validation of its URL. The `remote` field in build.json is the
 /// trigger; absent → this isn't called.
