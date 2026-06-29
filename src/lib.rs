@@ -355,6 +355,18 @@ pub fn lm(prompt: &str) -> String {
     message
 }
 
+/// If the repo has no `origin` remote, set it to `url`. Existing remote left
+/// alone — no validation of its URL. The `remote` field in build.json is the
+/// trigger; absent → this isn't called.
+pub fn ensure_remote(repo: &git2::Repository, url: &str) {
+    if repo.find_remote("origin").is_ok() {
+        return;
+    }
+    repo.remote("origin", url)
+        .unwrap_or_else(|e| panic!("setting remote origin to {url}: {e}"));
+    println!("[buidl] set remote origin → {url}");
+}
+
 /// Stage everything in `repo`'s workdir. `add_all` with `DEFAULT` already
 /// respects the project's `.gitignore`, so we don't keep a parallel ignore
 /// list — if something noisy lands in the diff, the project's `.gitignore`

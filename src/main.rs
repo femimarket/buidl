@@ -55,6 +55,10 @@ fn main() {
         let repo = git2::Repository::open(path)
             .unwrap_or_else(|e| panic!("opening git repo at {}: {e}", path.display()));
 
+        if let Some(remote_url) = &entry.remote {
+            buidl::ensure_remote(&repo, remote_url);
+        }
+
         let mut index = buidl::stage_all(&repo);
         let (head_tree, files) = buidl::diff_files(&repo, &index);
         if files.is_empty() {
